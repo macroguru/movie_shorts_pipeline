@@ -80,6 +80,8 @@ class MovieResult:
     config: Optional[Config] = field(default=None, repr=False)
     source: str = SOURCE_MOVIE       # movie (фильм) или stream (стрим)
     caption: Optional[str] = None    # готовая HTML-подпись Telegram (для стримов)
+    # Сегменты клипов в источнике: [{"start","end","start_seconds",...}, ...]
+    clip_segments: list = field(default_factory=list)
 
 
 def detect_year(video_path: str) -> Optional[int]:
@@ -440,6 +442,7 @@ def process_video(
         description_path=description_path,
         post_data=post_data,
         config=config,
+        clip_segments=clips,
     )
 
 
@@ -1035,6 +1038,7 @@ def process_stream(
         config=config,
         source=SOURCE_STREAM,
         caption=build_stream_caption(code, title, post_data),
+        clip_segments=clips,
     )
 
 
@@ -1279,6 +1283,7 @@ def process_clip(
         config=config,
         source=SOURCE_CLIP,
         caption=build_stream_caption(code, resolved_title, post_data),
+        clip_segments=clips,
     )
 
 
@@ -1393,6 +1398,7 @@ def process_twitch_clips(
     total = len(paths)
     renders: list = [None] * total
     done = 0
+    twitch_durations: list = [0.0] * total  # длительности исходников по клипам
 
     def render_one(args):
         i, path = args
@@ -1401,6 +1407,7 @@ def process_twitch_clips(
             duration = int(float(info.get("duration") or 0))
             if duration < 1:
                 raise VideoEditorError(f"Не удалось определить длительность: {path}")
+            twitch_durations[i - 1] = float(duration)
             render = video_editor.render_short(
                 video_path=path,
                 start="00:00:00",
@@ -1463,7 +1470,125 @@ def process_twitch_clips(
         config=config,
         source=SOURCE_STREAM,
         caption=build_twitch_caption(streamer, games),
+        clip_segments=[
+            {"start": "00:00:00", "end": _seconds_to_hms(d),
+             "start_seconds": 0.0, "end_seconds": d}
+            for d in twitch_durations
+        ],
     )
+
+
+def rerender_clip(
+    result: MovieResult,
+    clip_index: int,
+    env_path: str = None,
+    log: Optional[LogFn] = None,
+    fps: Optional[int] = None,
+    subtitle_style: Optional[str] = None,
+    preset: Optional[str] = None,
+) -> dict:
+    """
+    Пересоздание одного клипа: тот же исходник, тот же сегмент, свежий рендер.
+
+    Нужен, когда клип не понравился: пользователь меняет пресет/FPS/субтитры
+    и перерендеривает без нового прохода анализа.
+
+    Args:
+        result: Итог одного из process_* вызовов
+        clip_index: Номер клипа (1-based, как в интерфейсе)
+        env_path: Путь к .env (если конфиг не приехал в результате)
+        log: Куда писать сообщения этапами
+        fps: Частота кадров выхода (None = из конфига)
+        subtitle_style: Стиль субтитров (None = из конфига)
+        preset: Пресет монтажа (None = из конфига)
+
+    Returns:
+        Словарь рендера: {"clip_path", "poster_path", "duration", ...}
+
+    Raises:
+        PipelineError: если сегмент неизвестен или рендер не удался
+    """
+    emit = _make_emitter(log)
+
+    config = result.config or Config(env_path=env_path)
+    result.config = config
+
+    if not (1 <= clip_index <= len(result.clip_segments)):
+        raise PipelineError(
+            f"Клип {clip_index} вне диапазона 1..{len(result.clip_segments)} "
+            "(сегмент источника неизвестен — пересоздание недоступно)"
+        )
+
+    segment = result.clip_segments[clip_index - 1]
+    start = segment.get("start") or "00:00:00"
+    end = segment.get("end") or start
+
+    video_path = None
+    if result.source == SOURCE_STREAM and result.post_data.get("streamer") is not None:
+        pass  # пачка клипов Twitch: у каждого клипа свой исходник, путь не сохранён
+    else:
+        # Исходник ищем в базе: последний записанный путь для этого кода
+        row = Database().get_by_code(result.code)
+        video_path = (row or {}).get("video_path")
+
+    if not video_path or not Path(video_path).exists():
+        raise PipelineError(
+            f"Исходный файл недоступен: {video_path or 'не найден в базе'}"
+        )
+
+    emit(f"Пересоздание клипа {clip_index}: {start} - {end}")
+
+    video_editor = VideoEditor(config)
+    subtitle_style_eff = subtitle_style or getattr(config, "subtitle_style", "bold")
+    words = segment.get("words") or []
+
+    # Пресет: по типу источника; у пачки Twitch оверлея с кодом нет
+    source_kind = "clip" if result.post_data.get("streamer") is not None else result.source
+    edit_preset = _resolve_preset(preset, source_kind, config, fps, subtitle_style_eff)
+    if edit_preset is not None:
+        edit_preset.overlay_code = False if source_kind == "clip" else edit_preset.overlay_code
+
+    try:
+        if edit_preset is not None:
+            ass_path = _build_clip_ass(
+                config, result.code, clip_index, words,
+                edit_preset.subtitle_style,
+                clip_start=segment.get("start_seconds") or 0.0,
+            )
+            facecam = _safe_facecam(video_path, edit_preset, config)
+            render = video_editor.render_highlight(
+                video_path=video_path,
+                start=start,
+                end=end,
+                code=result.code,
+                clip_index=clip_index,
+                preset=edit_preset,
+                title_text=result.title,
+                ass_path=ass_path,
+                facecam_box=facecam,
+                min_duration=0.0,
+            )
+        else:
+            render = video_editor.render_short(
+                video_path=video_path,
+                start=start,
+                end=end,
+                code=result.code,
+                clip_index=clip_index,
+                title_text=result.title,
+                min_duration=0.0,
+                with_overlay=False,
+            )
+    except VideoEditorError as e:
+        raise PipelineError(f"Ошибка пересоздания: {e}")
+
+    # Обновляем путь клипа в результате и в базе
+    if 1 <= clip_index <= len(result.clip_paths):
+        result.clip_paths[clip_index - 1] = render["clip_path"]
+        Database().update_clip_paths(result.code, json.dumps(result.clip_paths))
+
+    emit(f"Клип {clip_index} пересоздан: {render['clip_path']}")
+    return render
 
 
 def publish_result(result: MovieResult, env_path: str = None, log: Optional[LogFn] = None) -> int:
