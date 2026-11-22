@@ -1,0 +1,33 @@
+# Секреты и конфиденциальные данные
+.env
+client_secrets.json
+*.token
+*_token.json
+
+# База данных
+*.db
+*.sqlite3
+
+# Результаты работы
+output/
+
+# Резервные копии
+backup_*/
+
+# Временные файлы и тесты
+temp/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Логи
+logs/
+*.log
+
+# ОС
+Thumbs.db
+.DS_Store
