@@ -44,6 +44,46 @@ class Config:
         # Кодировщик видео: auto (NVENC, если есть GPU), nvenc или cpu
         self.video_encoder = os.getenv("VIDEO_ENCODER", "auto").strip().lower()
 
+        # ---------- AI-провайдеры (текст и зрение настраиваются отдельно) ----------
+        # Текстовый провайдер: gemini | openai_compatible
+        self.ai_text_provider = os.getenv("AI_TEXT_PROVIDER", "gemini").strip().lower()
+        self.ai_text_model = os.getenv("AI_TEXT_MODEL", "") or self.gemini_model
+        # Ключ: отдельный или общий GEMINI_API_KEY
+        self.ai_text_api_key = os.getenv("AI_TEXT_API_KEY", "") or self.gemini_api_key
+        # Базовый URL — только для openai_compatible
+        self.ai_text_base_url = os.getenv("AI_TEXT_BASE_URL", "").strip() or None
+
+        # Vision-провайдер: gemini | openai_compatible | none (vision отключён)
+        self.ai_vision_provider = os.getenv("AI_VISION_PROVIDER", "gemini").strip().lower()
+        self.ai_vision_model = os.getenv("AI_VISION_MODEL", "") or self.gemini_model
+        self.ai_vision_api_key = os.getenv("AI_VISION_API_KEY", "") or self.gemini_api_key
+        self.ai_vision_base_url = os.getenv("AI_VISION_BASE_URL", "").strip() or None
+
+        # ---------- Highlight-движок ----------
+        self.highlight_min_duration = float(os.getenv("HIGHLIGHT_MIN_DURATION", "20"))
+        self.highlight_max_duration = float(os.getenv("HIGHLIGHT_MAX_DURATION", "60"))
+        self.highlight_workers = int(os.getenv("HIGHLIGHT_WORKERS", "3"))
+        # Визуальная проверка кандидатов: auto (если есть vision-провайдер) | off
+        self.highlight_vision_check = os.getenv("HIGHLIGHT_VISION_CHECK", "auto").strip().lower()
+
+        # ---------- Монтаж ----------
+        # Частота кадров выхода: 30 или 60
+        try:
+            self.output_fps = int(os.getenv("OUTPUT_FPS", "30"))
+        except ValueError:
+            self.output_fps = 30
+        # Нормализация аудио (EBU R128 loudnorm)
+        self.audio_normalize = os.getenv("AUDIO_NORMALIZE", "1").strip().lower() in ("1", "true", "yes", "on")
+        # Шумоподавление (afftdn) — по умолчанию выключено
+        self.noise_reduction = os.getenv("NOISE_REDUCTION", "0").strip().lower() in ("1", "true", "yes", "on")
+        # Стиль субтитров: bold | boxed | karaoke
+        self.subtitle_style = os.getenv("SUBTITLE_STYLE", "bold").strip().lower()
+        # Пресет монтажа: auto (по типу источника) | movie | stream | clip | podcast | gaming | off
+        self.editing_preset = os.getenv("EDITING_PRESET", "auto").strip().lower()
+
+        # ---------- Кэш анализа ----------
+        self.cache_enabled = os.getenv("ANALYSIS_CACHE", "1").strip().lower() in ("1", "true", "yes", "on")
+
         # YouTube Shorts (фича необязательна): OAuth-секреты, токен, статус и категория видео
         self.youtube_client_secrets = Path(
             os.getenv("YOUTUBE_CLIENT_SECRETS", Path(__file__).parent / "client_secrets.json")
@@ -68,14 +108,19 @@ class Config:
         if not self.gemini_api_key:
             errors.append("GEMINI_API_KEY не указан в .env файле")
 
-        if not self.telegram_bot_token:
-            errors.append("TELEGRAM_BOT_TOKEN не указан в .env файле")
-
-        if not self.telegram_channel_id:
-            errors.append("TELEGRAM_CHANNEL_ID не указан в .env файле")
+        # Telegram — необязателен: приложение работает и без публикации,
+        # публиковать можно позже (publish_result проверит ключи сам)
+        if not self.telegram_bot_token or not self.telegram_channel_id:
+            print("Предупреждение: TELEGRAM_BOT_TOKEN/TELEGRAM_CHANNEL_ID не заданы — "
+                  "публикация в Telegram будет недоступна")
 
         if errors:
             raise ConfigError("\n".join(errors))
+
+    @property
+    def telegram_configured(self) -> bool:
+        """Достаточно ли ключей для публикации в Telegram."""
+        return bool(self.telegram_bot_token and self.telegram_channel_id)
 
         # Валидация формата channel_id
         channel_id = self.telegram_channel_id.strip()
