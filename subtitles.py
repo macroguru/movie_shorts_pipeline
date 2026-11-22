@@ -5,11 +5,13 @@
 
 import subprocess
 import json
+import hashlib
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from dataclasses import dataclass
 
 from config import Config
+from cache import AnalysisCache
 
 
 @dataclass
@@ -407,3 +409,212 @@ class Subtitles:
         """
         entries = self.parse_srt()
         return " ".join(entry.text.replace("\n", " ") for entry in entries)
+
+    # ---------- Транскрибация с пословными таймкодами (для HighlightEngine) ----------
+
+    def transcribe_with_words(self, video_path: str, log=None) -> List[Dict[str, Any]]:
+        """
+        Транскрибация видео с таймкодами слов через faster-whisper.
+
+        Результат кэшируется в AnalysisCache по (размер файла, mtime,
+        длительность, модель whisper) и дублируется JSON-файлом в
+        temp/cache/transcripts/<hash>.json. Кэш работает и когда
+        config.cache_enabled выключен: файловая копия всё равно пишется,
+        но для кэширования используется AnalysisCache.
+
+        Args:
+            video_path: Путь к видеофайлу
+            log: Куда писать прогресс (Optional[Callable[[str], None]])
+
+        Returns:
+            Список сегментов: {start, end, text, words: [(слово, start, end), ...]}
+
+        Raises:
+            SubtitleError: на ошибке ffmpeg, модели или транскрибации
+        """
+        emit = log if log is not None else (lambda message: print(message))
+        video_path = Path(video_path)
+
+        if not video_path.exists():
+            raise SubtitleError(f"Видеофайл не найден: {video_path}")
+
+        cache = AnalysisCache(self.config)
+        duration = self._probe_duration(video_path)
+        content_hash = self._transcript_content_hash(video_path, duration)
+        params = {"whisper_model": self.config.whisper_model}
+
+        cached = cache.get("transcript", content_hash, params)
+        if cached:
+            emit("Транскрипт найден в кэше")
+            try:
+                return json.loads(cached)
+            except json.JSONDecodeError:
+                emit("Кэш транскрипта повреждён, транскрибирую заново")
+
+        segments = self._run_whisper_words(video_path, emit)
+
+        # В кэш — только если включён; JSON-зеркало пишется всегда
+        if cache.enabled:
+            cache.put("transcript", content_hash, params, json.dumps(segments, ensure_ascii=False))
+        self._mirror_transcript(content_hash, segments)
+
+        cache.close()
+        return segments
+
+    def _transcript_content_hash(self, video_path: Path, duration: Optional[float]) -> str:
+        """
+        Хэш-идентификатор видео для кэша транскрипта: размер, mtime, длительность.
+
+        Args:
+            video_path: Путь к видеофайлу
+            duration: Длительность в секундах (или None, если ffprobe не ответил)
+
+        Returns:
+            hex-строка SHA256
+        """
+        stat = video_path.stat()
+        raw = json.dumps([
+            str(video_path.resolve()),
+            stat.st_size,
+            int(stat.st_mtime),
+            duration,
+        ], ensure_ascii=False)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def _probe_duration(self, video_path: Path) -> Optional[float]:
+        """
+        Длительность видео через ffprobe (None при любой ошибке).
+
+        Args:
+            video_path: Путь к видеофайлу
+
+        Returns:
+            Длительность в секундах или None
+        """
+        try:
+            result = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v", "quiet",
+                    "-print_format", "json",
+                    "-show_format",
+                    str(video_path),
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            data = json.loads(result.stdout)
+            return float(data["format"]["duration"])
+        except (subprocess.CalledProcessError, json.JSONDecodeError,
+                KeyError, ValueError, OSError) as e:
+            print(f"Не удалось определить длительность: {e}")
+            return None
+
+    def _mirror_transcript(self, content_hash: str, segments: List[Dict[str, Any]]) -> None:
+        """
+        Зеркалирование транскрипта в temp/cache/transcripts/<hash>.json.
+
+        Args:
+            content_hash: Хэш-идентификатор видео
+            segments: Сегменты транскрипта
+        """
+        try:
+            mirror_dir = self.temp_dir / "cache" / "transcripts"
+            mirror_dir.mkdir(parents=True, exist_ok=True)
+            mirror_path = mirror_dir / f"{content_hash}.json"
+            mirror_path.write_text(
+                json.dumps(segments, ensure_ascii=False), encoding="utf-8"
+            )
+        except OSError as e:
+            print(f"Не удалось сохранить зеркало транскрипта: {e}")
+
+    def _run_whisper_words(self, video_path: Path, emit) -> List[Dict[str, Any]]:
+        """
+        Извлечение аудио и запуск faster-whisper с word_timestamps=True.
+
+        Args:
+            video_path: Путь к видеофайлу
+            emit: Колбэк лога
+
+        Returns:
+            Список сегментов с словами
+
+        Raises:
+            SubtitleError: на ошибке ffmpeg, загрузки модели или транскрибации
+        """
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError:
+            raise SubtitleError(
+                "faster-whisper не установлен. Выполните: pip install faster-whisper"
+            )
+
+        # Аудио в temp wav: 16 кГц, моно — формат faster-whisper
+        audio_path = self.temp_dir / "audio_words_temp.wav"
+
+        try:
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-i", str(video_path),
+                    "-vn",
+                    "-acodec", "pcm_s16le",
+                    "-ar", "16000",
+                    "-ac", "1",
+                    "-y",
+                    str(audio_path),
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        except subprocess.CalledProcessError as e:
+            raise SubtitleError(f"Ошибка извлечения аудио: {e}")
+
+        emit(
+            f"Загрузка модели Whisper '{self.config.whisper_model}' "
+            f"для устройства {self.config.whisper_device}..."
+        )
+
+        try:
+            model = WhisperModel(
+                self.config.whisper_model,
+                device=self.config.whisper_device,
+                compute_type="int8" if self.config.whisper_device == "cpu" else "float16",
+            )
+        except Exception as e:
+            raise SubtitleError(f"Ошибка загрузки модели Whisper: {e}")
+
+        emit("Транскрибация с пословными таймкодами (это может быть долго)...")
+
+        try:
+            raw_segments, _info = model.transcribe(
+                str(audio_path),
+                language="ru",
+                word_timestamps=True,
+                vad_filter=True,
+            )
+            segments = []
+            for segment in raw_segments:
+                words = [
+                    (word.word.strip(), float(word.start), float(word.end))
+                    for word in (segment.words or [])
+                ]
+                segments.append({
+                    "start": float(segment.start),
+                    "end": float(segment.end),
+                    "text": segment.text.strip(),
+                    "words": words,
+                })
+        except Exception as e:
+            raise SubtitleError(f"Ошибка транскрибации: {e}")
+        finally:
+            if audio_path.exists():
+                try:
+                    audio_path.unlink()
+                except OSError:
+                    pass
+
+        emit(f"Транскрибация завершена: {len(segments)} сегментов")
+        return segments

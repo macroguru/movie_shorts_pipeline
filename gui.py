@@ -9,18 +9,22 @@
 - Фильм — субтитры → Gemini ищет вирусные сцены → вертикальные клипы
 - Стрим — субтитры → Gemini ищет яркие моменты (или моменты задаются вручную)
 - Twitch — клипы/VOD скачиваются по ссылкам и нарезаются как стрим
+- Клип — локальный файл или ссылка на любое видео → вертикальный шортс
 
 Usage:
     python gui.py
 """
 
+import json
 import logging
+import os
 import queue
 import re
 import subprocess
 import sys
 import threading
 from pathlib import Path
+from typing import Optional
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -28,6 +32,7 @@ from tkinter import filedialog, messagebox, ttk
 from ai_engine import AIEngine
 from config import Config
 from core import (
+    SOURCE_CLIP,
     SOURCE_MOVIE,
     SOURCE_STREAM,
     PipelineError,
@@ -35,11 +40,13 @@ from core import (
     guess_title,
     parse_moments,
     post_link,
+    process_clip,
     process_stream,
     process_twitch_clips,
     process_video,
     publish_result,
     publish_youtube,
+    rerender_clip,
 )
 from youtube_publisher import YouTubePublisher, SETUP_INSTRUCTION
 
@@ -66,6 +73,8 @@ class PipelineGUI:
         self.result = None          # MovieResult после успешной обработки
         self.busy = False
         self.events = queue.Queue() # из рабочего потока в главный
+        self._clips_before_clip = None  # значение «Клипов:» до входа в режим клипа
+        self._clip_segments = {}    # iid строки дерева → номер сегмента источника (1-based)
 
         self._build_ui()
         self._poll_events()
@@ -121,7 +130,7 @@ class PipelineGUI:
         self.source_var = tk.StringVar(value="Фильм")
         source_box = ttk.Combobox(
             mode, textvariable=self.source_var,
-            values=("Фильм", "Стрим"), state="readonly", width=10,
+            values=("Фильм", "Стрим", "Клип"), state="readonly", width=10,
         )
         source_box.pack(side="left", padx=(4, 16))
         source_box.bind("<<ComboboxSelected>>", lambda _e: self._on_source_changed())
@@ -136,14 +145,46 @@ class PipelineGUI:
         twitch = ttk.Frame(form)
         twitch.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(6, 0))
 
-        ttk.Label(twitch, text="Twitch:").pack(side="left")
+        # В режиме клипа поле принимает любой URL видео, поэтому подпись меняется
+        self.twitch_label_var = tk.StringVar(value="Twitch:")
+        ttk.Label(twitch, textvariable=self.twitch_label_var).pack(side="left")
         self.twitch_var = tk.StringVar()
-        ttk.Entry(twitch, textvariable=self.twitch_var).pack(
-            side="left", fill="x", expand=True, padx=4
+        self.twitch_entry = ttk.Entry(twitch, textvariable=self.twitch_var)
+        self.twitch_entry.pack(side="left", fill="x", expand=True, padx=4)
+        self.twitch_hint_var = tk.StringVar(
+            value="(ссылка на клип/VOD, можно несколько через запятую)"
         )
-        ttk.Label(twitch, text="(ссылка на клип/VOD, можно несколько через запятую)").pack(
-            side="left"
-        )
+        ttk.Label(twitch, textvariable=self.twitch_hint_var).pack(side="left")
+
+        # Настройки монтажа: FPS, стиль субтитров и пресет
+        settings = ttk.Frame(form)
+        settings.grid(row=5, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        ttk.Label(settings, text="FPS:").pack(side="left")
+        self.fps_var = tk.StringVar(value="по умолчанию")
+        ttk.Combobox(
+            settings, textvariable=self.fps_var,
+            values=("по умолчанию", "30", "60"), state="readonly", width=13,
+        ).pack(side="left", padx=(4, 16))
+
+        ttk.Label(settings, text="Субтитры:").pack(side="left")
+        self.subtitle_var = tk.StringVar(value="по умолчанию")
+        ttk.Combobox(
+            settings, textvariable=self.subtitle_var,
+            values=("по умолчанию", "bold", "boxed", "karaoke"),
+            state="readonly", width=13,
+        ).pack(side="left", padx=(4, 16))
+
+        ttk.Label(settings, text="Пресет:").pack(side="left")
+        self.preset_var = tk.StringVar(value="по умолчанию")
+        ttk.Combobox(
+            settings, textvariable=self.preset_var,
+            values=(
+                "по умолчанию", "auto", "movie", "stream",
+                "clip", "podcast", "gaming", "off",
+            ),
+            state="readonly", width=13,
+        ).pack(side="left", padx=4)
 
         self._on_source_changed()
 
@@ -188,6 +229,40 @@ class PipelineGUI:
         log_scroll = ttk.Scrollbar(self.log_text, command=self.log_text.yview)
         log_scroll.pack(side="right", fill="y")
         self.log_text.configure(yscrollcommand=log_scroll.set)
+
+        # Готовые клипы: список с длительностями и действиями над каждым
+        clips_frame = ttk.Frame(self.notebook)
+        self.notebook.add(clips_frame, text="Клипы")
+
+        tree_wrap = ttk.Frame(clips_frame)
+        tree_wrap.pack(fill="both", expand=True, padx=10, pady=(10, 0))
+
+        self.clips_tree = ttk.Treeview(
+            tree_wrap, columns=("file", "duration"), show="headings"
+        )
+        self.clips_tree.heading("file", text="Файл")
+        self.clips_tree.heading("duration", text="Длительность")
+        self.clips_tree.column("file", anchor="w")
+        self.clips_tree.column("duration", width=110, anchor="e", stretch=False)
+        self.clips_tree.pack(side="left", fill="both", expand=True)
+
+        tree_scroll = ttk.Scrollbar(
+            tree_wrap, orient="vertical", command=self.clips_tree.yview
+        )
+        tree_scroll.pack(side="right", fill="y")
+        self.clips_tree.configure(yscrollcommand=tree_scroll.set)
+
+        clip_buttons = ttk.Frame(clips_frame)
+        clip_buttons.pack(fill="x", padx=10, pady=6)
+        ttk.Button(clip_buttons, text="Открыть", command=self._open_selected_clip).pack(
+            side="left"
+        )
+        ttk.Button(
+            clip_buttons, text="Отклонить", command=self._reject_selected_clip
+        ).pack(side="left", padx=8)
+        ttk.Button(
+            clip_buttons, text="Пересоздать", command=self._rerender_selected_clip
+        ).pack(side="left")
 
         # Статусная строка
         self.status_var = tk.StringVar(value="Готово")
@@ -255,36 +330,86 @@ class PipelineGUI:
             self.events.put(("title_resolved", raw_title, resolved, None))
 
     def _on_source_changed(self):
-        """Поле моментов активно только в режиме стрима."""
-        is_stream = self.source_var.get() == "Стрим"
+        """Моменты активны только в стриме; в клипе поле ссылки принимает любой URL."""
+        mode = self.source_var.get()
+        is_stream = mode == "Стрим"
+        is_clip = mode == "Клип"
+
         self.moments_entry.config(state="normal" if is_stream else "disabled")
         if not is_stream:
             self.moments_var.set("")
+
+        self.twitch_label_var.set("Файл / ссылка:" if is_clip else "Twitch:")
+        self.twitch_hint_var.set(
+            "(ссылка на любое видео или путь к файлу, можно несколько через запятую)"
+            if is_clip
+            else "(ссылка на клип/VOD, можно несколько через запятую)"
+        )
+
+        # В режиме клипа по умолчанию один короткий ролик; вернувшись
+        # в другие режимы, восстанавливаем прежнее значение
+        if is_clip:
+            if self._clips_before_clip is None:
+                self._clips_before_clip = self.clips_var.get()
+                self.clips_var.set(1)
+        elif self._clips_before_clip is not None:
+            self.clips_var.set(self._clips_before_clip)
+            self._clips_before_clip = None
 
     def _validated_inputs(self):
         path = self.path_var.get().strip()
         title = self.title_var.get().strip()
         raw_year = self.year_var.get().strip()
         clips = self.clips_var.get()
-        source = SOURCE_STREAM if self.source_var.get() == "Стрим" else SOURCE_MOVIE
+        mode_label = self.source_var.get()
+        if mode_label == "Стрим":
+            source = SOURCE_STREAM
+        elif mode_label == "Клип":
+            source = SOURCE_CLIP
+        else:
+            source = SOURCE_MOVIE
         twitch_raw = self.twitch_var.get().strip()
         moments_raw = self.moments_var.get().strip() if source == SOURCE_STREAM else ""
 
         twitch_urls = [u for u in re.split(r"[,\s]+", twitch_raw) if u] if twitch_raw else []
 
-        if not twitch_urls:
-            if not path:
-                messagebox.showwarning("Нет файла", "Выберите файл или укажите ссылку Twitch.")
+        clip_inputs = []
+        if source == SOURCE_CLIP:
+            # Либо локальный файл, либо ссылка (или несколько ссылок) на видео
+            if path and twitch_urls:
+                messagebox.showwarning(
+                    "Лишний источник",
+                    "Укажите либо файл, либо ссылку — не одновременно.",
+                )
+                return None
+            if path:
+                if not Path(path).exists():
+                    messagebox.showerror("Файл не найден", f"Такого файла нет:\n{path}")
+                    return None
+                clip_inputs = [path]
+            else:
+                clip_inputs = twitch_urls
+            if not clip_inputs:
+                messagebox.showwarning(
+                    "Нет источника", "Выберите файл или укажите ссылку на видео."
+                )
                 self._choose_file()
                 return None
-            if not Path(path).exists():
-                messagebox.showerror("Файл не найден", f"Такого файла нет:\n{path}")
-                return None
+            # Название в режиме клипа необязательно: берётся из заголовка видео
+        else:
+            if not twitch_urls:
+                if not path:
+                    messagebox.showwarning("Нет файла", "Выберите файл или укажите ссылку Twitch.")
+                    self._choose_file()
+                    return None
+                if not Path(path).exists():
+                    messagebox.showerror("Файл не найден", f"Такого файла нет:\n{path}")
+                    return None
 
-        # Название обязательно, кроме клипов Twitch — там берётся из заголовка
-        if not title and not twitch_urls:
-            messagebox.showwarning("Нет названия", "Укажите название.")
-            return None
+            # Название обязательно, кроме клипов Twitch — там берётся из заголовка
+            if not title and not twitch_urls:
+                messagebox.showwarning("Нет названия", "Укажите название.")
+                return None
 
         year = None
         if raw_year:
@@ -302,6 +427,9 @@ class PipelineGUI:
                 return None
             moments = moments_raw
 
+        # Настройки монтажа: «по умолчанию» означает «берутся из .env» (None)
+        render_kwargs = self._render_kwargs()
+
         return {
             "path": path,
             "title": title,
@@ -310,6 +438,10 @@ class PipelineGUI:
             "source": source,
             "twitch_urls": twitch_urls,
             "moments": moments,
+            "clip_inputs": clip_inputs,
+            "fps": render_kwargs["fps"],
+            "subtitle_style": render_kwargs["subtitle_style"],
+            "preset": render_kwargs["preset"],
         }
 
     # ---------- запуск ----------
@@ -326,12 +458,22 @@ class PipelineGUI:
         self._set_busy(True, "Обработка началась...")
         self._clear_log()
         self.progress["value"] = 0
+        self.clips_tree.delete(*self.clips_tree.get_children())
         self._log("=" * 60)
         self._log("Запуск обработки")
-        if inputs["twitch_urls"]:
+        if inputs["source"] == SOURCE_CLIP:
+            self._log(f"Режим: Клип ({len(inputs['clip_inputs'])} источник(ов))")
+        elif inputs["twitch_urls"]:
             self._log(f"Режим: Twitch ({len(inputs['twitch_urls'])} ссылок)")
         else:
             self._log(f"Режим: {'Стрим' if inputs['source'] == SOURCE_STREAM else 'Фильм'}")
+        if inputs["twitch_urls"] and (
+            inputs["fps"] or inputs["subtitle_style"] or inputs["preset"]
+        ):
+            self._log(
+                "Примечание: FPS/субтитры/пресет к пачке клипов Twitch не применяются "
+                "(для неё настройки берутся из .env)."
+            )
         self._log("=" * 60)
 
         worker = threading.Thread(
@@ -345,9 +487,38 @@ class PipelineGUI:
         """Рабочий поток: только складывает события в очередь, GUI не трогает."""
         log_cb = lambda message: self.events.put(("log", message))
         progress_cb = lambda done, total: self.events.put(("progress", done, total))
+        # Настройки монтажа передаём, только если пользователь их выбрал
+        # («по умолчанию» → None → ядро берёт значения из .env)
+        render_kwargs = {}
+        if inputs["fps"]:
+            render_kwargs["fps"] = inputs["fps"]
+        if inputs["subtitle_style"]:
+            render_kwargs["subtitle_style"] = inputs["subtitle_style"]
+        if inputs["preset"]:
+            render_kwargs["preset"] = inputs["preset"]
 
         try:
-            if inputs["twitch_urls"]:
+            if inputs["source"] == SOURCE_CLIP:
+                # Один вызов на источник: путь или ссылка, каждый даёт свой результат.
+                # Несколько ссылок собираем в один результат: клипы — все вместе,
+                # пост и описание — по первому источнику.
+                result = None
+                for item in inputs["clip_inputs"]:
+                    log_cb(f"Источник: {item}")
+                    item_result = process_clip(
+                        source_path_or_url=item,
+                        title=inputs["title"] or None,
+                        clips_count=inputs["clips"],
+                        env_path=None,
+                        log=log_cb,
+                        progress=progress_cb,
+                        **render_kwargs,
+                    )
+                    if result is None:
+                        result = item_result
+                    else:
+                        result.clip_paths.extend(item_result.clip_paths)
+            elif inputs["twitch_urls"]:
                 result = process_twitch_clips(
                     urls=inputs["twitch_urls"],
                     title=inputs["title"] or None,
@@ -364,6 +535,7 @@ class PipelineGUI:
                     year=inputs["year"],
                     log=log_cb,
                     progress=progress_cb,
+                    **render_kwargs,
                 )
             else:
                 result = process_video(
@@ -373,6 +545,7 @@ class PipelineGUI:
                     year=inputs["year"],
                     log=log_cb,
                     progress=progress_cb,
+                    **render_kwargs,
                 )
         except PipelineError as e:
             self.events.put(("run_failed", str(e)))
@@ -459,6 +632,149 @@ class PipelineGUI:
         except OSError as e:
             messagebox.showerror("Папка", f"Не удалось открыть {folder}:\n{e}")
 
+    # ---------- готовые клипы ----------
+
+    def _populate_clips_tree(self):
+        """Список готовых клипов с длительностями в момент завершения обработки."""
+        self.clips_tree.delete(*self.clips_tree.get_children())
+        self._clip_segments.clear()
+        for index, clip_path in enumerate(self.result.clip_paths, start=1):
+            # Номер клипа нужен пересозданию: core ждёт 1-based индекс сегмента
+            self._clip_segments[str(clip_path)] = index
+            duration = self._clip_duration(clip_path)
+            self.clips_tree.insert(
+                "", "end",
+                iid=str(clip_path),  # путь как идентификатор строки
+                values=(Path(clip_path).name, self._format_duration(duration)),
+            )
+
+    @staticmethod
+    def _clip_duration(clip_path) -> Optional[float]:
+        """Длительность готового клипа через ffprobe; None, если не удалось."""
+        try:
+            proc = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v", "quiet",
+                    "-print_format", "json",
+                    "-show_format",
+                    str(clip_path),
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=15,
+            )
+            duration = float(json.loads(proc.stdout).get("format", {}).get("duration", 0))
+            return duration or None
+        except Exception:  # noqa: BLE001 — отсутствие длительности не критично
+            return None
+
+    @staticmethod
+    def _format_duration(duration: Optional[float]) -> str:
+        return f"{int(duration // 60)}:{int(duration % 60):02d}" if duration else "—"
+
+    def _selected_clip(self) -> Optional[str]:
+        selection = self.clips_tree.selection()
+        if not selection:
+            messagebox.showinfo("Клипы", "Выберите клип в списке.")
+            return None
+        return selection[0]
+
+    def _open_selected_clip(self):
+        """Открыть выбранный клип системным проигрывателем."""
+        clip_path = self._selected_clip()
+        if clip_path is None:
+            return
+        if not Path(clip_path).exists():
+            messagebox.showerror("Клип не найден", f"Такого файла нет:\n{clip_path}")
+            return
+        try:
+            if sys.platform == "win32":
+                os.startfile(clip_path)  # noqa: S606 — только локальные файлы
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", clip_path])
+            else:
+                subprocess.Popen(["xdg-open", clip_path])
+        except OSError as e:
+            messagebox.showerror("Клип", f"Не удалось открыть {clip_path}:\n{e}")
+
+    def _reject_selected_clip(self):
+        """Удалить файл клипа и убрать его из результата публикации."""
+        clip_path = self._selected_clip()
+        if clip_path is None:
+            return
+        if not messagebox.askyesno(
+            "Отклонить клип",
+            f"Удалить файл без возможности восстановления?\n\n{clip_path}",
+        ):
+            return
+
+        try:
+            os.remove(clip_path)
+        except OSError as e:
+            messagebox.showerror("Отклонение клипа", f"Не удалось удалить файл:\n{e}")
+            return
+
+        if self.result is not None:
+            self.result.clip_paths = [
+                p for p in self.result.clip_paths if str(p) != clip_path
+            ]
+        self.clips_tree.delete(clip_path)
+        self._clip_segments.pop(clip_path, None)
+        self._log(f"Клип отклонён: {Path(clip_path).name}")
+
+    def _render_kwargs(self) -> dict:
+        """Настройки монтажа из строки настроек; «по умолчанию» → None → из .env."""
+        fps_raw = self.fps_var.get().strip()
+        subtitle_raw = self.subtitle_var.get().strip()
+        preset_raw = self.preset_var.get().strip()
+        return {
+            "fps": int(fps_raw) if fps_raw.isdigit() else None,
+            "subtitle_style": subtitle_raw if subtitle_raw != "по умолчанию" else None,
+            "preset": preset_raw if preset_raw != "по умолчанию" else None,
+        }
+
+    def _rerender_selected_clip(self):
+        """Пересоздать тот же отрезок источника свежим рендером (в фоне)."""
+        clip_path = self._selected_clip()
+        if clip_path is None:
+            return
+        clip_index = self._clip_segments.get(clip_path)
+        if not clip_index or self.result is None \
+                or clip_index > len(self.result.clip_segments):
+            messagebox.showinfo(
+                "Пересоздание",
+                "Для этого клипа нет данных об отрезке источника — "
+                "пересоздание недоступно.",
+            )
+            return
+
+        self._set_busy(True, "Пересоздание клипа...")
+        worker = threading.Thread(
+            target=self._rerender_worker,
+            args=(clip_path, clip_index, self._render_kwargs()),
+            daemon=True,
+        )
+        worker.start()
+
+    def _rerender_worker(self, clip_path, clip_index, render_kwargs):
+        """Рабочий поток пересоздания: тот же сегмент, свежий рендер."""
+        try:
+            info = rerender_clip(
+                self.result,
+                clip_index,
+                log=lambda message: self.events.put(("log", message)),
+                **render_kwargs,
+            )
+        except PipelineError as e:
+            self.events.put(("rerender_failed", clip_path, str(e)))
+        except Exception as e:  # noqa: BLE001 - показываем любое неожиданное
+            logger.exception("Непредвиденная ошибка пересоздания")
+            self.events.put(("rerender_failed", clip_path, f"{type(e).__name__}: {e}"))
+        else:
+            self.events.put(("rerender_done", clip_path, info))
+
     # ---------- обработка событий из рабочих потоков ----------
 
     def _poll_events(self):
@@ -487,6 +803,12 @@ class PipelineGUI:
             self._set_busy(False, "Ошибка обработки")
             self._log(f"ОШИБКА: {event[1]}")
             messagebox.showerror("Ошибка обработки", event[1])
+        elif kind == "rerender_done":
+            self._on_rerender_done(event[1], event[2])
+        elif kind == "rerender_failed":
+            self._set_busy(False, "Ошибка пересоздания")
+            self._log(f"ОШИБКА: {event[2]}")
+            messagebox.showerror("Пересоздание клипа", event[2])
         elif kind == "publish_done":
             self._on_publish_done(event[1])
         elif kind == "publish_failed":
@@ -521,6 +843,7 @@ class PipelineGUI:
         self.result = result
         self._set_busy(False, "Обработка завершена — можно публиковать")
         self.progress["value"] = self.progress["maximum"]
+        self._populate_clips_tree()
 
         self.desc_text.delete("1.0", "end")
         self.desc_text.insert("1.0", result.description)
@@ -578,6 +901,29 @@ class PipelineGUI:
             f"Загружено клипов: {len(uploaded)}\n\n"
             + "\n".join(item["url"] for item in uploaded),
         )
+
+    def _on_rerender_done(self, old_clip_path, info):
+        """Свежий рендер готов: обновляем строку дерева и путь в результате."""
+        self._set_busy(False, "Клип пересоздан")
+        new_path = str(info.get("clip_path") or old_clip_path)
+        duration = info.get("duration") or self._clip_duration(new_path)
+
+        if new_path != old_clip_path:
+            # Рендер записал файл под другим именем: переносим строку,
+            # путь в result.clip_paths уже обновлён rerender_clip
+            self.clips_tree.delete(old_clip_path)
+            self.clips_tree.insert(
+                "", "end",
+                iid=new_path,
+                values=(Path(new_path).name, self._format_duration(duration)),
+            )
+            self._clip_segments[new_path] = self._clip_segments.pop(old_clip_path, 0)
+        else:
+            # Тот же путь: обновляем только длительность
+            self.clips_tree.item(old_clip_path, values=(
+                Path(old_clip_path).name, self._format_duration(duration),
+            ))
+        self._log(f"✅ Клип пересоздан: {Path(new_path).name}")
 
     # ---------- вспомогательное ----------
 

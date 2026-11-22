@@ -1,8 +1,10 @@
 """
-AI Engine модуль для анализа субтитров через Google Gemini.
-Находит вирусные сцены и генерирует текст поста.
+AI Engine модуль для анализа субтитров через AI-провайдер (Gemini или
+OpenAI-совместимый API через providers.py). Находит вирусные сцены и
+генерирует текст поста. Ответы кэшируются в AnalysisCache.
 """
 
+import hashlib
 import json
 import re
 from pathlib import Path
@@ -10,6 +12,9 @@ from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 
 from config import Config
+from providers import ProviderError, create_text_provider
+from cache import AnalysisCache
+from usage import UsageTracker
 
 
 @dataclass
@@ -107,10 +112,23 @@ class AIEngine:
         """
         self.config = config
         self._client = None
+        self._cache = AnalysisCache(config)
+        # temp_dir может отсутствовать в тестовых фейках конфига:
+        # учёт важен только для реальных вызовов API
+        temp_dir = getattr(config, "temp_dir", None)
+        if temp_dir is not None:
+            self._usage = UsageTracker(Path(temp_dir) / "usage.jsonl")
+        else:
+            self._usage = UsageTracker()
 
     @property
     def client(self):
-        """Ленивая инициализация клиента Gemini."""
+        """
+        Ленивая инициализация клиента Gemini.
+
+        Оставлен для обратной совместимости: внутренние вызовы идут через
+        текстовый провайдер (providers.py).
+        """
         if self._client is None:
             try:
                 from google import genai
@@ -144,17 +162,14 @@ class AIEngine:
         )
 
         try:
-            response = self.client.models.generate_content(
-                model=self.config.gemini_model,
-                contents=prompt
-            )
-        except Exception as e:
-            raise AIEngineError(f"Ошибка Gemini API: {e}")
+            response = self._call_gemini(prompt)
+        except AIEngineError:
+            raise
 
-        title = (response.text or "").strip().strip('"«»')
+        title = response.strip().strip('"«»')
 
         if not title:
-            raise AIEngineError("Gemini вернул пустое название")
+            raise AIEngineError("Провайдер вернул пустое название")
 
         return title
 
@@ -190,10 +205,13 @@ class AIEngine:
         # Формируем промпт
         prompt = self._build_prompt(subtitles_text, clips_count)
 
-        # Отправляем запрос в Gemini
-        response = self._call_gemini(prompt)
-
-        # Парсим ответ
+        # Отправляем запрос (с кэшем) и разбираем ответ
+        response = self._cached_call(
+            kind="analyze",
+            content_hash=self._subs_hash(srt_content),
+            params={"clips_count": clips_count},
+            prompt=prompt,
+        )
         return self._parse_response(response)
 
     def analyze_subtitles_stream(
@@ -239,10 +257,17 @@ class AIEngine:
             max_duration=max_duration,
         )
 
-        # Отправляем запрос в Gemini
-        response = self._call_gemini(prompt)
-
-        # Парсим ответ
+        # Отправляем запрос (с кэшем) и разбираем ответ
+        response = self._cached_call(
+            kind="analyze_stream",
+            content_hash=self._subs_hash(srt_content),
+            params={
+                "clips_count": clips_count,
+                "min_duration": min_duration,
+                "max_duration": max_duration,
+            },
+            prompt=prompt,
+        )
         return self._parse_response(response, stream=True)
 
     def _prepare_subtitles_for_analysis(self, srt_content: str) -> str:
@@ -346,22 +371,174 @@ class AIEngine:
 
     def _call_gemini(self, prompt: str) -> str:
         """
-        Вызов Gemini API.
+        Вызов текстового провайдера (Gemini или OpenAI-совместимый).
+
+        Имя метода сохранено для обратной совместимости; запрос идёт через
+        create_text_provider(config).
 
         Args:
             prompt: Промпт для отправки
 
         Returns:
             Ответ модели
+
+        Raises:
+            AIEngineError: на ошибке провайдера (исходное сообщение сохранено)
         """
         try:
-            response = self.client.models.generate_content(
-                model=self.config.gemini_model,
-                contents=prompt
-            )
-            return response.text
-        except Exception as e:
-            raise AIEngineError(f"Ошибка Gemini API: {e}")
+            provider = create_text_provider(self.config, self._usage)
+        except ProviderError as e:
+            raise AIEngineError(f"Ошибка провайдера: {e}")
+
+        try:
+            return provider.complete(prompt)
+        except ProviderError as e:
+            raise AIEngineError(f"Ошибка AI API: {e}")
+
+    def _subs_hash(self, srt_content: str) -> str:
+        """
+        SHA256 содержимого субтитров — часть ключа кэша анализа.
+
+        Args:
+            srt_content: Содержимое SRT файла
+
+        Returns:
+            hex-строка SHA256
+        """
+        return hashlib.sha256(srt_content.encode("utf-8")).hexdigest()
+
+    def _cached_call(
+        self,
+        kind: str,
+        content_hash: str,
+        params: dict,
+        prompt: str,
+    ) -> str:
+        """
+        Вызов провайдера с кэшированием ответа в AnalysisCache.
+
+        Args:
+            kind: Тип записи кэша (analyze | analyze_stream)
+            content_hash: Хэш субтитров
+            params: Параметры запроса (влияют на результат)
+            prompt: Готовый промпт
+
+        Returns:
+            Ответ модели (из кэша или свежий)
+
+        Raises:
+            AIEngineError: на ошибке провайдера
+        """
+        # Хэш промпта входит в параметры: разные промпты при том же хэше
+        # субтитров (например, после правки критериев) не должны делить кэш
+        cache_params = dict(params)
+        cache_params["prompt_sha"] = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+
+        cached = self._cache.get(kind, content_hash, cache_params)
+        if cached:
+            return cached
+
+        response = self._call_gemini(prompt)
+        self._cache.put(kind, content_hash, cache_params, response)
+        return response
+
+    def summarize_stream_moments(self, highlights: list, title: str = "") -> dict:
+        """
+        Данные поста для подборки моментов стрима: один вызов провайдера.
+
+        Принимает Highlight-объекты (highlights.py) или словари — читает
+        reason/transcript/keywords.
+
+        Args:
+            highlights: Найденные моменты (Highlight или dict с reason/transcript/keywords)
+            title: Название стрима или стримера
+
+        Returns:
+            {"title", "context", "hashtags"} — стримовый формат post_data
+
+        Raises:
+            AIEngineError: на ошибке провайдера или невалидном JSON
+        """
+        if not highlights:
+            raise AIEngineError("Список моментов пуст — нечего описывать")
+
+        moments_lines = []
+        for i, moment in enumerate(highlights, 1):
+            if isinstance(moment, dict):
+                reason = moment.get("reason", "")
+                transcript = moment.get("transcript", "")
+                keywords = moment.get("keywords", [])
+                start = moment.get("start_seconds", moment.get("start_sec", 0))
+                end = moment.get("end_seconds", moment.get("end_sec", 0))
+            else:
+                reason = getattr(moment, "reason", "")
+                transcript = getattr(moment, "transcript", "")
+                keywords = getattr(moment, "keywords", [])
+                start = getattr(moment, "start_seconds", 0)
+                end = getattr(moment, "end_seconds", 0)
+
+            minutes, seconds = divmod(max(int(start), 0), 60)
+            timecode = f"{minutes:02d}:{seconds:02d}"
+            hours, rest = divmod(minutes, 60)
+            if hours:
+                timecode = f"{hours}:{rest:02d}:{seconds:02d}"
+
+            end_minutes, end_seconds_int = divmod(max(int(end), 0), 60)
+            end_timecode = f"{end_minutes:02d}:{end_seconds_int:02d}"
+            end_hours, end_rest = divmod(end_minutes, 60)
+            if end_hours:
+                end_timecode = f"{end_hours}:{end_rest:02d}:{end_seconds_int:02d}"
+
+            line = f"{i}. [{timecode}-{end_timecode}] {reason}"
+            if keywords:
+                line += f" (теги: {', '.join(keywords[:5])})"
+            if transcript:
+                line += f"\n   Реплики: {transcript[:500]}"
+            moments_lines.append(line)
+
+        moments_text = "\n".join(moments_lines)[:50000]
+        title_line = f'Название стрима: "{title}".\n' if title else ""
+
+        prompt = (
+            f"{title_line}Список найденных ярких моментов записи стрима:\n\n"
+            f"{moments_text}\n\n"
+            "На основе этих моментов подготовь данные для публикации подборки.\n"
+            "ВЕРНИ СТРОГИЙ JSON:\n"
+            '{"title": "Тема подборки — короткая фраза", '
+            '"context": "Что происходит в подборке, 2-3 предложения, без спойлеров", '
+            '"hashtags": "3-7 хэштегов через пробел без решётки"}\n'
+            "Без пояснений вне JSON, валидный JSON."
+        )
+
+        response = self._call_gemini(prompt)
+
+        data = None
+        match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", response, re.DOTALL)
+        if match:
+            try:
+                data = json.loads(match.group(1))
+            except json.JSONDecodeError:
+                data = None
+        if data is None:
+            match = re.search(r"\{.*\}", response, re.DOTALL)
+            if match:
+                try:
+                    data = json.loads(match.group(0))
+                except json.JSONDecodeError as e:
+                    raise AIEngineError(f"Невалидный JSON от провайдера: {e}")
+
+        if not isinstance(data, dict):
+            raise AIEngineError("Не удалось извлечь JSON из ответа провайдера")
+
+        missing = {"title", "context", "hashtags"} - set(data.keys())
+        if missing:
+            raise AIEngineError(f"В ответе отсутствуют поля: {', '.join(sorted(missing))}")
+
+        return {
+            "title": str(data["title"]).strip(),
+            "context": str(data["context"]).strip(),
+            "hashtags": str(data["hashtags"]).strip(),
+        }
 
     def _parse_response(self, response: str) -> Dict[str, Any]:
         """

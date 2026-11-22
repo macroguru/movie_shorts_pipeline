@@ -6,7 +6,9 @@ Movie Shorts Pipeline CLI
 Режимы:
   movie  — фильм из локального файла (субтитры → Gemini → клипы);
   stream — запись стрима: AI ищет моменты, либо моменты задаются вручную;
-  twitch — скачивание клипов Twitch по ссылкам и конвертация в вертикальный формат.
+  twitch — скачивание клипов Twitch по ссылкам и конвертация в вертикальный формат;
+  clip   — любой источник (локальный файл или ссылка на видео: Twitch, YouTube и др.)
+           → вертикальный шортс.
 
 Usage:
     # Фильм (режим по умолчанию)
@@ -23,6 +25,12 @@ Usage:
 
     # VOD Twitch: скачать и нарезать
     python cli.py --twitch https://www.twitch.tv/videos/123456789 -t "Стрим" -c 5
+
+    # Клип из любого видео по ссылке (yt-dlp скачает сам)
+    python cli.py --url https://www.youtube.com/watch?v=AbCdEf -t "Клип"
+
+    # Клип из локального файла с настройками монтажа
+    python cli.py -s clip -i fragment.mp4 -t "Клип" --fps 60 --subtitle-style boxed --preset clip
 """
 
 import argparse
@@ -38,6 +46,7 @@ from core import (
     download_twitch_source,
     parse_moments,
     post_link,
+    process_clip,
     process_stream,
     process_twitch_clips,
     process_video,
@@ -69,6 +78,9 @@ def parse_args() -> argparse.Namespace:
   python cli.py -s stream -i stream.mp4 -t "Стрим" --moments "1:23:45-1:25:00, 2:00:10-2:01:00"
   python cli.py --twitch https://clips.twitch.tv/Abc --twitch https://clips.twitch.tv/Def
   python cli.py --twitch https://www.twitch.tv/videos/123456789 -t "Стрим" -c 5
+  python cli.py --url https://www.youtube.com/watch?v=AbCdEf -t "Клип"
+  python cli.py -s clip -i fragment.mp4 -t "Клип" --fps 60 --subtitle-style boxed --preset clip
+  python cli.py -s stream -i stream.mp4 -t "Стрим" --min-duration 15 --max-duration 45
         """
     )
 
@@ -100,9 +112,10 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument(
         "--source", "-s",
-        choices=["movie", "stream"],
+        choices=["movie", "stream", "clip"],
         default="movie",
-        help="Тип источника: movie — фильм, stream — запись стрима (по умолчанию movie)"
+        help="Тип источника: movie — фильм, stream — запись стрима, "
+             "clip — файл или ссылка на любое видео (по умолчанию movie)"
     )
 
     parser.add_argument(
@@ -116,6 +129,52 @@ def parse_args() -> argparse.Namespace:
         action="append",
         default=None,
         help="Ссылка на клип или VOD Twitch (можно указать несколько раз)"
+    )
+
+    parser.add_argument(
+        "--url",
+        action="append",
+        default=None,
+        help="Ссылка на любое видео (Twitch, YouTube и др.) — режим clip, "
+             "обрабатывается через process_clip; можно указать несколько раз"
+    )
+
+    parser.add_argument(
+        "--fps",
+        choices=["30", "60"],
+        default=None,
+        help="Частота кадров выхода: 30 или 60 (по умолчанию — из .env)"
+    )
+
+    parser.add_argument(
+        "--subtitle-style",
+        choices=["bold", "boxed", "karaoke"],
+        default=None,
+        help="Стиль субтитров: bold, boxed или karaoke (по умолчанию — из .env)"
+    )
+
+    parser.add_argument(
+        "--preset",
+        choices=["auto", "movie", "stream", "clip", "podcast", "gaming", "off"],
+        default=None,
+        help="Пресет монтажа: auto, movie, stream, clip, podcast, gaming, off "
+             "(по умолчанию — из .env)"
+    )
+
+    parser.add_argument(
+        "--min-duration",
+        type=float,
+        default=None,
+        help="Минимальная длительность момента в секундах для stream/clip "
+             "(по умолчанию — из .env)"
+    )
+
+    parser.add_argument(
+        "--max-duration",
+        type=float,
+        default=None,
+        help="Максимальная длительность момента в секундах для stream/clip "
+             "(по умолчанию — из .env)"
     )
 
     parser.add_argument(
@@ -149,6 +208,15 @@ def make_progress():
 def cli_log(message: str):
     """Лог пайплайна в stdout."""
     logger.info(str(message))
+
+
+def render_kwargs(args) -> dict:
+    """Настройки монтажа из CLI: None означает «взять из .env»."""
+    return {
+        "fps": int(args.fps) if args.fps else None,
+        "subtitle_style": args.subtitle_style,
+        "preset": args.preset,
+    }
 
 
 def finish(args, result) -> int:
@@ -201,6 +269,7 @@ def run_movie(args) -> int:
             env_path=args.env,
             log=cli_log,
             progress=progress,
+            **render_kwargs(args),
         )
     finally:
         bar.close()
@@ -232,11 +301,61 @@ def run_stream(args) -> int:
             env_path=args.env,
             log=cli_log,
             progress=progress,
+            min_duration=args.min_duration,
+            max_duration=args.max_duration,
+            **render_kwargs(args),
         )
     finally:
         bar.close()
 
     return finish(args, result)
+
+
+def run_clip(args) -> int:
+    """Режим clip: локальный файл или ссылка на любое видео → вертикальный шортс."""
+    sources = []
+    if args.input:
+        sources.append(args.input)
+    if args.url:
+        sources.extend(args.url)
+
+    if not sources:
+        logger.error("Режим clip требует --input (видеофайл) или --url (ссылка на видео)")
+        return 1
+
+    # Локальные пути проверяем сразу; ссылки проверит пайплайн при скачивании
+    for source_item in sources:
+        if not source_item.lower().startswith(("http://", "https://")) \
+                and not Path(source_item).exists():
+            logger.error(f"Видеофайл не найден: {source_item}")
+            return 1
+
+    exit_code = 0
+    for source_item in sources:
+        logger.info(f"Обработка клипа: {source_item}")
+        logger.info(f"Название: {args.title or 'из заголовка видео'}, Клипов: {args.clips}")
+
+        progress, bar = make_progress()
+        try:
+            result = process_clip(
+                source_path_or_url=source_item,
+                title=args.title,
+                clips_count=args.clips,
+                env_path=args.env,
+                log=cli_log,
+                progress=progress,
+                min_duration=args.min_duration,
+                max_duration=args.max_duration,
+                **render_kwargs(args),
+            )
+        finally:
+            bar.close()
+
+        code = finish(args, result)
+        if code != 0:
+            exit_code = code
+
+    return exit_code
 
 
 def run_twitch(args) -> int:
@@ -290,6 +409,9 @@ def run_twitch(args) -> int:
                 env_path=args.env,
                 log=cli_log,
                 progress=progress,
+                min_duration=args.min_duration,
+                max_duration=args.max_duration,
+                **render_kwargs(args),
             )
         finally:
             bar.close()
@@ -314,11 +436,15 @@ def main() -> int:
         return 1
 
     try:
+        if args.url:
+            return run_clip(args)
+
         if args.twitch:
             return run_twitch(args)
 
         if not args.input:
-            logger.error("Укажите --input (видеофайл) или --twitch (ссылки Twitch)")
+            logger.error("Укажите --input (видеофайл), --url (ссылка на видео) "
+                         "или --twitch (ссылки Twitch)")
             return 1
 
         if not Path(args.input).exists():
@@ -327,6 +453,9 @@ def main() -> int:
 
         if args.source == "stream":
             return run_stream(args)
+
+        if args.source == "clip":
+            return run_clip(args)
 
         return run_movie(args)
 
