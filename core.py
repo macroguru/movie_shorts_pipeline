@@ -132,7 +132,7 @@ def guess_title(video_path: str) -> str:
         Предложенное название
     """
     stem = re.sub(r"[\[\]\(\)]", " ", Path(video_path).stem)
-    tokens = [t for t in re.split(r"[._]+", stem) if t]
+    tokens = [t for t in re.split(r"[._\s]+", stem) if t]
 
     kept = []
     for token in tokens:
