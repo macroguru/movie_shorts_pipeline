@@ -24,13 +24,15 @@ from video_editor import VideoEditor, VideoEditorError
 from publisher import Publisher, PublisherError
 from youtube_publisher import YouTubePublisher, YouTubeError, SETUP_INSTRUCTION
 from twitch_downloader import TwitchDownloader, TwitchDownloadError, is_clip_url
+from source_downloader import download_video, SourceDownloadError, is_url
 
 
 logger = logging.getLogger(__name__)
 
-# Режимы обработки: фильм или запись стрима
+# Режимы обработки: фильм, запись стрима или короткий клип
 SOURCE_MOVIE = "movie"
 SOURCE_STREAM = "stream"
+SOURCE_CLIP = "clip"
 
 # Функции обратного вызова для интерфейсов: лог и прогресс
 LogFn = Callable[[str], None]
@@ -441,6 +443,96 @@ def process_video(
     )
 
 
+# ---------- Пресеты монтажа и субтитры клипов ----------
+
+def _resolve_preset(preset_name: Optional[str], source: str, config: Config,
+                    fps: Optional[int] = None, subtitle_style: Optional[str] = None):
+    """
+    Пресет монтажа для рендера.
+
+    preset_name None/«auto» → пресет по типу источника; «off» → None,
+    что означает старый путь render_short без новых эффектов.
+    """
+    effective = (preset_name or getattr(config, "editing_preset", "auto") or "auto").strip().lower()
+    if effective == "auto":
+        effective = source
+
+    if effective == "off":
+        return None
+
+    try:
+        from editor import get_preset
+
+        return get_preset(effective, config, fps=fps, subtitle_style=subtitle_style)
+    except Exception as e:  # noqa: BLE001 — рендер не должен падать из-за пресета
+        logger.warning(f"Не удалось собрать пресет монтажа: {e}")
+        return None
+
+
+def _build_clip_ass(config: Config, code: str, clip_index: int,
+                    words: list, style: str, clip_start: float = 0.0) -> Optional[Path]:
+    """
+    ASS-файл с субтитрами клипа из word-timestamps транскрипта.
+
+    Args:
+        config: Конфигурация
+        code: Код подборки
+        clip_index: Номер клипа (1-based)
+        words: Слова момента [(слово, начало, конец), ...] в секундах источника
+        style: Стиль субтитров (bold/boxed/karaoke)
+        clip_start: Начало клипа в источнике (для смещения таймкодов)
+
+    Returns:
+        Путь к ASS или None, если слов нет
+    """
+    if not words:
+        return None
+
+    try:
+        from editor import build_ass
+
+        # Группируем слова в реплики по паузам > 0.8с
+        lines = []
+        current = []
+        prev_end = None
+        for word, w_start, w_end in words:
+            if prev_end is not None and (w_start - prev_end) > 0.8 and current:
+                lines.append(current)
+                current = []
+            current.append((word, w_start, w_end))
+            prev_end = w_end
+        if current:
+            lines.append(current)
+
+        segments = []
+        for line_words in lines:
+            seg_start = line_words[0][1] - clip_start
+            seg_end = line_words[-1][2] - clip_start
+            if seg_end <= 0 or seg_start < 0:
+                continue
+            text = " ".join(w for w, _s, _e in line_words)
+            segments.append({"start": seg_start, "end": seg_end, "text": text, "words": line_words})
+
+        out = config.temp_dir / f"subs_{code}_{clip_index}.ass"
+        return build_ass(segments, style, out)
+    except Exception as e:  # noqa: BLE001 — субтитры не критичны
+        logger.warning(f"Не удалось построить субтитры клипа {clip_index}: {e}")
+        return None
+
+
+def _safe_facecam(video_path: str, preset, config: Config):
+    """Детекция facecam с тихим фоллбэком на None."""
+    if getattr(preset, "layout", "blur") != "facecam":
+        return None
+    try:
+        from editor import detect_facecam
+
+        return detect_facecam(video_path, config)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Facecam не обнаружен: {e}")
+        return None
+
+
 # ---------- Режим стрима ----------
 
 def _time_string_to_seconds(text: str) -> float:
@@ -718,6 +810,11 @@ def process_stream(
     env_path: str = None,
     log: Optional[LogFn] = None,
     progress: Optional[ProgressFn] = None,
+    fps: Optional[int] = None,
+    subtitle_style: Optional[str] = None,
+    preset: Optional[str] = None,
+    min_duration: Optional[float] = None,
+    max_duration: Optional[float] = None,
 ) -> MovieResult:
     """
     Полный цикл нарезки стрима: субтитры → AI-моменты (или ручные таймкоды)
@@ -793,17 +890,58 @@ def process_stream(
         except VideoEditorError:
             pass
 
-        emit("Шаг 2: AI поиск ярких моментов стрима...")
+        # Шаг 2: продвинутый движок хайлайтов (аудио + транскрипт + AI),
+        # при любой ошибке — откат на старый путь (субтитры → Gemini)
+        subtitle_words: dict = {}  # индекс клипа → слова для субтитров
+        highlights = None
+        emit("Шаг 2: поиск ярких моментов (многоступенчатый анализ)...")
         try:
-            ai_result = ai_engine.analyze_subtitles_stream(clips_count=clips_count)
-            clips = ai_engine.get_clips_with_seconds(ai_result)
-            post_data = ai_result["post_data"]
-        except AIEngineError as e:
-            raise PipelineError(f"Ошибка AI анализа: {e}")
+            from highlights import HighlightEngine
 
-        emit(f"Найдено моментов: {len(clips)}")
-        for i, clip in enumerate(clips, 1):
-            emit(f"  Момент {i}: {clip['start']} - {clip['end']} — {clip['hook_description']}")
+            engine = HighlightEngine(config, log=emit)
+            if min_duration is not None:
+                engine.min_duration = float(min_duration)
+            if max_duration is not None:
+                engine.max_duration = float(max_duration)
+            highlights = engine.find_highlights(str(path), clips_count=clips_count, source="stream")
+        except Exception as e:  # noqa: BLE001 — фоллбэк обязателен
+            emit(f"  Продвинутый движок недоступен ({e}); откат на анализ субтитров")
+
+        if highlights:
+            clips = []
+            for i, hl in enumerate(highlights, 1):
+                clips.append({
+                    "start": _seconds_to_hms(hl.start_seconds),
+                    "end": _seconds_to_hms(hl.end_seconds),
+                    "start_seconds": hl.start_seconds,
+                    "end_seconds": hl.end_seconds,
+                    "hook_description": hl.reason or "",
+                })
+                subtitle_words[i] = hl.words or []
+            emit(f"Найдено моментов: {len(clips)}")
+            for i, clip in enumerate(clips, 1):
+                emit(f"  Момент {i}: {clip['start']} - {clip['end']} — {clip['hook_description']}")
+            try:
+                post_data = ai_engine.summarize_stream_moments(highlights, title=title)
+            except Exception as e:  # noqa: BLE001 — описание не критично
+                logger.warning(f"Не удалось собрать описание через AI: {e}")
+                post_data = {"title": title, "context": "", "hashtags": ""}
+        else:
+            emit("Шаг 2 (резерв): AI поиск по субтитрам...")
+            try:
+                ai_result = ai_engine.analyze_subtitles_stream(
+                    clips_count=clips_count,
+                    min_duration=min_duration or 20.0,
+                    max_duration=max_duration or 60.0,
+                )
+                clips = ai_engine.get_clips_with_seconds(ai_result)
+                post_data = ai_result["post_data"]
+            except AIEngineError as e:
+                raise PipelineError(f"Ошибка AI анализа: {e}")
+
+            emit(f"Найдено моментов: {len(clips)}")
+            for i, clip in enumerate(clips, 1):
+                emit(f"  Момент {i}: {clip['start']} - {clip['end']} — {clip['hook_description']}")
 
     # Шаг 3: рендер — как у фильмов, но без минимальных 40 секунд:
     # момент стрима живёт своей длительностью
@@ -811,18 +949,38 @@ def process_stream(
     total = len(clips)
     renders: list = [None] * total
 
+    edit_preset = _resolve_preset(preset, "stream", config, fps, subtitle_style)
+
     def render_one(args):
         i, clip = args
         try:
-            render = video_editor.render_short(
-                video_path=str(path),
-                start=clip["start"],
-                end=clip["end"],
-                code=code,
-                clip_index=i,
-                title_text=title,
-                min_duration=0.0,
+            ass_path = _build_clip_ass(
+                config, code, i, subtitle_words.get(i), edit_preset.subtitle_style,
+                clip_start=clip.get("start_seconds") or 0.0,
             )
+            if edit_preset is not None and ass_path is not None:
+                facecam = _safe_facecam(str(path), edit_preset, config)
+                render = video_editor.render_highlight(
+                    video_path=str(path),
+                    start=clip["start"],
+                    end=clip["end"],
+                    code=code,
+                    clip_index=i,
+                    preset=edit_preset,
+                    title_text=title,
+                    ass_path=ass_path,
+                    facecam_box=facecam,
+                )
+            else:
+                render = video_editor.render_short(
+                    video_path=str(path),
+                    start=clip["start"],
+                    end=clip["end"],
+                    code=code,
+                    clip_index=i,
+                    title_text=title,
+                    min_duration=0.0,
+                )
             return i, render, None
         except VideoEditorError as e:
             return i, None, str(e)
@@ -877,6 +1035,250 @@ def process_stream(
         config=config,
         source=SOURCE_STREAM,
         caption=build_stream_caption(code, title, post_data),
+    )
+
+
+# ---------- Режим клипа ----------
+
+def process_clip(
+    source_path_or_url: str,
+    title: Optional[str] = None,
+    clips_count: int = 1,
+    env_path: str = None,
+    log: Optional[LogFn] = None,
+    progress: Optional[ProgressFn] = None,
+    fps: Optional[int] = None,
+    subtitle_style: Optional[str] = None,
+    preset: Optional[str] = None,
+    min_duration: Optional[float] = None,
+    max_duration: Optional[float] = None,
+) -> MovieResult:
+    """
+    Режим «Клип»: короткое видео (ссылка или файл) → готовый вертикальный шортс.
+
+    Источник анализируется (транскрипт + AI), выбирается самый интересный
+    фрагмент с сохранением контекста, добавляются субтитры и рендерится
+    вертикальное видео. Работает с клипами Twitch, YouTube и любыми
+    источниками yt-dlp, а также с локальными файлами.
+
+    Args:
+        source_path_or_url: Путь к файлу или ссылка на видео
+        title: Название (по умолчанию — заголовок с платформы или имя файла)
+        clips_count: Сколько клипов сделать из одного источника
+        env_path: Путь к .env файлу
+        log: Куда писать сообщения этапами
+        progress: Колбэк (готово, всего)
+        fps: Частота кадров выхода (None = из конфига)
+        subtitle_style: Стиль субтитров (None = из конфига)
+        preset: Пресет монтажа (None = из конфига)
+        min_duration: Минимальная длительность клипа (None = из конфига)
+        max_duration: Максимальная длительность клипа (None = из конфига)
+
+    Returns:
+        MovieResult с готовым вертикальным клипом
+
+    Raises:
+        PipelineError: на ошибке скачивания, анализа или рендера
+    """
+    emit = _make_emitter(log)
+
+    try:
+        config = Config(env_path=env_path)
+    except Exception as e:
+        raise PipelineError(f"Ошибка конфигурации: {e}")
+
+    # Источник: ссылка или локальный файл
+    source = str(source_path_or_url).strip()
+    if not source:
+        raise PipelineError("Не указан источник (файл или ссылка)")
+
+    if is_url(source):
+        emit(f"Скачиваем видео по ссылке: {source}")
+        try:
+            path, url_title = download_video(source, config.temp_dir / "sources", log=emit)
+        except SourceDownloadError as e:
+            raise PipelineError(f"Ошибка скачивания: {e}")
+        resolved_title = (title or "").strip() or (url_title or "").strip()
+    else:
+        path = Path(source)
+        if not path.exists():
+            raise PipelineError(f"Файл не найден: {path}")
+        resolved_title = (title or "").strip() or path.stem
+
+    video_editor = VideoEditor(config)
+    try:
+        info = video_editor.get_video_info(str(path))
+        duration = float(info.get("duration") or 0)
+    except VideoEditorError as e:
+        raise PipelineError(f"Не удалось прочитать видео: {e}")
+
+    if duration < 2:
+        raise PipelineError(f"Видео слишком короткое ({duration:.1f}с)")
+
+    year = datetime.now().year
+    db = Database()
+    code = db.get_unique_code()
+    emit(f"Внутренний код подборки: {code}")
+
+    resolved_title = resolved_title or "Клип"
+    movie_dir = config.set_movie_context(code, resolved_title, year)
+    emit(f"Папка: {movie_dir}")
+
+    # Анализ: поиск лучшего фрагмента многоступенчатым движком
+    emit("Шаг 1: анализ клипа (транскрипт + AI поиск интересного фрагмента)...")
+    clip_min = min_duration if min_duration is not None else max(5.0, min(duration, config.highlight_min_duration))
+    clip_max = max_duration if max_duration is not None else max(clip_min, min(duration, config.highlight_max_duration))
+    if duration <= clip_max:
+        # Короткий клип целиком — сохраняем весь контекст
+        clips = [{
+            "start": "00:00:00",
+            "end": _seconds_to_hms(duration),
+            "start_seconds": 0.0,
+            "end_seconds": duration,
+            "hook_description": "Клип целиком",
+        }]
+        subtitle_words = {1: []}
+        post_data = {"title": resolved_title, "context": "", "hashtags": ""}
+        emit("Клип короткий — берём целиком, контекст сохраняется")
+    else:
+        try:
+            from highlights import HighlightEngine
+
+            engine = HighlightEngine(config, log=emit)
+            engine.min_duration = clip_min
+            engine.max_duration = clip_max
+            highlights = engine.find_highlights(str(path), clips_count=max(clips_count, 1), source="clip")
+        except Exception as e:  # noqa: BLE001 — фоллбэк на середину видео
+            emit(f"  Движок хайлайтов недоступен ({e}); берём центральный фрагмент")
+            highlights = None
+
+        if highlights:
+            clips = []
+            subtitle_words = {}
+            for i, hl in enumerate(highlights, 1):
+                clips.append({
+                    "start": _seconds_to_hms(hl.start_seconds),
+                    "end": _seconds_to_hms(hl.end_seconds),
+                    "start_seconds": hl.start_seconds,
+                    "end_seconds": hl.end_seconds,
+                    "hook_description": hl.reason or "",
+                })
+                subtitle_words[i] = hl.words or []
+            emit(f"Выбрано фрагментов: {len(clips)}")
+            for i, clip in enumerate(clips, 1):
+                emit(f"  Фрагмент {i}: {clip['start']} - {clip['end']} — {clip['hook_description']}")
+            try:
+                ai_engine = AIEngine(config)
+                post_data = ai_engine.summarize_stream_moments(highlights, title=resolved_title)
+            except Exception as e:  # noqa: BLE001 — описание не критично
+                logger.warning(f"Не удалось собрать описание через AI: {e}")
+                post_data = {"title": resolved_title, "context": "", "hashtags": ""}
+        else:
+            # Запасной путь: центральный фрагмент длительностью clip_max
+            mid = duration / 2
+            start = max(0.0, mid - clip_max / 2)
+            end = min(duration, start + clip_max)
+            clips = [{
+                "start": _seconds_to_hms(start),
+                "end": _seconds_to_hms(end),
+                "start_seconds": start,
+                "end_seconds": end,
+                "hook_description": "Центральный фрагмент",
+            }]
+            subtitle_words = {1: []}
+            post_data = {"title": resolved_title, "context": "", "hashtags": ""}
+
+    # Рендер: пресет клипа, субтитры, без оверлея с кодом
+    edit_preset = _resolve_preset(preset, "clip", config, fps, subtitle_style)
+    if edit_preset is not None:
+        edit_preset.overlay_code = False
+
+    emit("Шаг 2: рендер вертикальных клипов (параллельно)...")
+    total = len(clips)
+    renders: list = [None] * total
+
+    def render_one(args):
+        i, clip = args
+        try:
+            ass_path = _build_clip_ass(
+                config, code, i, subtitle_words.get(i), edit_preset.subtitle_style,
+                clip_start=clip.get("start_seconds") or 0.0,
+            ) if edit_preset is not None else None
+            if edit_preset is not None:
+                facecam = _safe_facecam(str(path), edit_preset, config)
+                render = video_editor.render_highlight(
+                    video_path=str(path),
+                    start=clip["start"],
+                    end=clip["end"],
+                    code=code,
+                    clip_index=i,
+                    preset=edit_preset,
+                    title_text=resolved_title,
+                    ass_path=ass_path,
+                    facecam_box=facecam,
+                    min_duration=0.0,
+                )
+            else:
+                render = video_editor.render_short(
+                    video_path=str(path),
+                    start=clip["start"],
+                    end=clip["end"],
+                    code=code,
+                    clip_index=i,
+                    title_text=resolved_title,
+                    min_duration=0.0,
+                    with_overlay=False,
+                )
+            return i, render, None
+        except VideoEditorError as e:
+            return i, None, str(e)
+
+    with ThreadPoolExecutor(max_workers=min(total, 3)) as pool:
+        for i, render, error in pool.map(render_one, enumerate(clips, 1)):
+            if error is not None:
+                emit(f"  Ошибка рендера клипа {i}: {error}")
+                logger.error(f"Ошибка рендера клипа {i}: {error}")
+            else:
+                renders[i - 1] = render
+                emit(f"  Клип {i} готов: {render['clip_path']} ({render['duration']}s)")
+            if progress is not None:
+                progress(len([r for r in renders if r is not None]), total)
+
+    clip_paths = [r["clip_path"] for r in renders if r is not None]
+    poster_path = next((r["poster_path"] for r in renders if r is not None), None)
+
+    if not clip_paths:
+        raise PipelineError("Не удалось создать ни одного клипа")
+
+    db.save_movie(
+        code=code,
+        title=resolved_title,
+        year=year,
+        genre="",
+        clip_paths=json.dumps(clip_paths),
+        poster_path=poster_path,
+        video_path=str(path),
+    )
+    emit("Информация сохранена в базу данных")
+
+    description = build_stream_description(code, resolved_title, post_data)
+    description_path = config.get_description_path(code)
+    description_path.write_text(description, encoding="utf-8")
+    emit(f"Описание сохранено: {description_path}")
+
+    return MovieResult(
+        code=code,
+        title=resolved_title,
+        year=year,
+        movie_dir=movie_dir,
+        clip_paths=clip_paths,
+        poster_path=poster_path,
+        description=description,
+        description_path=description_path,
+        post_data=post_data,
+        config=config,
+        source=SOURCE_CLIP,
+        caption=build_stream_caption(code, resolved_title, post_data),
     )
 
 
